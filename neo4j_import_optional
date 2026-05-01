@@ -1,0 +1,194 @@
+// neo4j_import.cypher
+// PSC (Companies House) import script for a simple Knowledge Graph in Neo4j.
+// Assumes you have placed these files in Neo4j's import directory:
+// - nodes.csv
+// - rels2.csv
+//
+// Example file URLs:
+// 'file:///nodes.csv'
+// 'file:///rels2.csv'
+
+////////////////////////////////////////////////////////////////////////////////
+// 0) OPTIONAL RESET (use only if you want to wipe the database)
+////////////////////////////////////////////////////////////////////////////////
+MATCH (n) DETACH DELETE n;
+
+////////////////////////////////////////////////////////////////////////////////
+// 1) DROP OLD CONSTRAINTS (safe to run even if they do not exist)
+////////////////////////////////////////////////////////////////////////////////
+DROP CONSTRAINT controller_entity_id_unique IF EXISTS;
+DROP CONSTRAINT controller_person_id_unique IF EXISTS;
+DROP CONSTRAINT company_id_unique IF EXISTS;
+DROP CONSTRAINT Property_1_nodes_uniq IF EXISTS;
+
+DROP CONSTRAINT company_company_id_unique IF EXISTS;
+DROP CONSTRAINT controller_person_controller_id_unique IF EXISTS;
+DROP CONSTRAINT controller_entity_controller_id_unique IF EXISTS;
+
+////////////////////////////////////////////////////////////////////////////////
+// 2) LOAD NODES FIRST (Company, ControllerEntity, ControllerPerson)
+////////////////////////////////////////////////////////////////////////////////
+
+// ControllerEntity nodes
+CALL {
+  LOAD CSV WITH HEADERS FROM 'file:///nodes.csv' AS row
+  WITH row WHERE row[':LABEL'] = 'ControllerEntity'
+  MERGE (e:ControllerEntity {controller_id: row['id:ID']})
+  SET
+    e.name = row.name,
+    e.controller_type = 'Controller-Entity',
+    e.country =
+      CASE
+        WHEN row.country_of_residence IS NOT NULL AND row.country_of_residence <> '' THEN row.country_of_residence
+        ELSE row.nationality
+      END
+  RETURN count(*) AS batch_rows
+} IN TRANSACTIONS OF 5000 ROWS
+RETURN sum(batch_rows) AS total_controller_entity_rows_processed;
+
+// ControllerPerson nodes
+CALL {
+  LOAD CSV WITH HEADERS FROM 'file:///nodes.csv' AS row
+  WITH row WHERE row[':LABEL'] = 'ControllerPerson'
+  MERGE (p:ControllerPerson {controller_id: row['id:ID']})
+  SET
+    p.name = row.name,
+    p.controller_type = 'Controller-Person',
+    p.country =
+      CASE
+        WHEN row.country_of_residence IS NOT NULL AND row.country_of_residence <> '' THEN row.country_of_residence
+        ELSE row.nationality
+      END
+  RETURN count(*) AS batch_rows
+} IN TRANSACTIONS OF 5000 ROWS
+RETURN sum(batch_rows) AS total_controller_person_rows_processed;
+
+// Company nodes
+CALL {
+  LOAD CSV WITH HEADERS FROM 'file:///nodes.csv' AS row
+  WITH row WHERE row[':LABEL'] = 'Company'
+  MERGE (c:Company {company_id: row['id:ID']})
+  SET c.name = row.name
+  RETURN count(*) AS batch_rows
+} IN TRANSACTIONS OF 5000 ROWS
+RETURN sum(batch_rows) AS total_company_rows_processed;
+
+////////////////////////////////////////////////////////////////////////////////
+// 3) CREATE UNIQUENESS CONSTRAINTS (recommended for correctness + speed)
+////////////////////////////////////////////////////////////////////////////////
+CREATE CONSTRAINT company_company_id_unique IF NOT EXISTS
+FOR (c:Company) REQUIRE c.company_id IS UNIQUE;
+
+CREATE CONSTRAINT controller_person_controller_id_unique IF NOT EXISTS
+FOR (p:ControllerPerson) REQUIRE p.controller_id IS UNIQUE;
+
+CREATE CONSTRAINT controller_entity_controller_id_unique IF NOT EXISTS
+FOR (e:ControllerEntity) REQUIRE e.controller_id IS UNIQUE;
+
+////////////////////////////////////////////////////////////////////////////////
+// 4) LOAD RELATIONSHIPS (CONTROLS) AFTER NODES EXIST
+////////////////////////////////////////////////////////////////////////////////
+CALL {
+  LOAD CSV WITH HEADERS FROM 'file:///rels2.csv' AS row
+
+  // Match controller node (can be ControllerPerson or ControllerEntity)
+  MATCH (s {controller_id: row[':START_ID']})
+  MATCH (t:Company {company_id: row[':END_ID']})
+
+  MERGE (s)-[r:CONTROLS]->(t)
+  SET
+    r.src_id = row[':START_ID'],
+    r.dst_id = row[':END_ID'],
+    r.source_type = 'PSC',
+    r.control_type = row.natures_of_control,
+    r.start_date = row.notified_on,
+    r.end_date = row.ceased_on
+
+  RETURN count(*) AS batch_rows
+} IN TRANSACTIONS OF 2000 ROWS
+RETURN sum(batch_rows) AS total_controls_rows_processed;
+
+////////////////////////////////////////////////////////////////////////////////
+// 5) QUICK SANITY CHECKS
+////////////////////////////////////////////////////////////////////////////////
+MATCH (n)
+RETURN labels(n) AS lbl, count(*) AS cnt
+ORDER BY cnt DESC;
+
+MATCH ()-[r:CONTROLS]->()
+RETURN count(r) AS controls_rels;
+
+////////////////////////////////////////////////////////////////////////////////
+// 6) BASIC EXPLORATION QUERIES
+////////////////////////////////////////////////////////////////////////////////
+
+// Top companies by number of controllers
+MATCH (u)-[:CONTROLS]->(c:Company)
+RETURN c.company_id, c.name, count(u) AS n_controllers
+ORDER BY n_controllers DESC
+LIMIT 10;
+
+// Top controllers by number of companies controlled
+MATCH (u)-[:CONTROLS]->(c:Company)
+RETURN u.controller_id, u.name, labels(u) AS type, count(c) AS n_companies
+ORDER BY n_companies DESC
+LIMIT 10;
+
+////////////////////////////////////////////////////////////////////////////////
+// 7) PARAMETERIZED LOOKUPS (examples)
+////////////////////////////////////////////////////////////////////////////////
+:param company_id => 'CH:07434180';
+
+MATCH p=(u)-[:CONTROLS]->(c:Company {company_id:$company_id})
+RETURN p
+LIMIT 200;
+
+:param controller_id => 'PSC:Q4obUUwOO7TeElahEzWmRh2QKxs';
+
+MATCH p=(u {controller_id:$controller_id})-[:CONTROLS]->(c:Company)
+RETURN p
+LIMIT 300;
+
+////////////////////////////////////////////////////////////////////////////////
+// 8) "ACTIVE AT TIME T" QUERY (uses start_date/end_date strings like YYYY/MM/DD)
+////////////////////////////////////////////////////////////////////////////////
+:param company_id => 'CH:OC337966';
+:param T => date('2016-10-15');
+
+MATCH (u)-[r:CONTROLS]->(c:Company {company_id:$company_id})
+WITH u, r,
+  split(r.start_date, '/') AS sd_parts,
+  CASE
+    WHEN r.end_date IS NULL OR r.end_date = '' THEN NULL
+    ELSE split(r.end_date, '/')
+  END AS ed_parts
+WITH u, r,
+  date({year: toInteger(sd_parts[0]), month: toInteger(sd_parts[1]), day: toInteger(sd_parts[2])}) AS sd,
+  CASE
+    WHEN ed_parts IS NULL THEN NULL
+    ELSE date({year: toInteger(ed_parts[0]), month: toInteger(ed_parts[1]), day: toInteger(ed_parts[2])})
+  END AS ed
+WHERE sd <= $T AND (ed IS NULL OR ed >= $T)
+RETURN
+  u.controller_id AS controller_id,
+  u.name AS controller_name,
+  r.control_type AS control_type,
+  r.start_date AS start_date,
+  r.end_date AS end_date
+LIMIT 200;
+
+////////////////////////////////////////////////////////////////////////////////
+// 9) OPTIONAL: SEARCH A PERSON BY NAME WITHIN A COMPANY'S CONTROLLERS
+////////////////////////////////////////////////////////////////////////////////
+:param company_id => 'CH:OC337966';
+:param person_name => 'Mr Dilipkumar';
+
+MATCH (p:ControllerPerson)-[r:CONTROLS]->(c:Company {company_id:$company_id})
+WHERE toLower(p.name) CONTAINS toLower($person_name)
+RETURN
+  p.controller_id AS controller_id,
+  p.name AS controller_name,
+  r.start_date AS start_date,
+  r.end_date AS end_date,
+  r.control_type AS control_type
+LIMIT 20;
