@@ -1,0 +1,9 @@
+# do not upload data / outputs
+data/
+results/
+
+# Jupyter / macOS / Python noise
+.ipynb_checkpoints/
+.DS_Store
+__pycache__/
+*.pyc
